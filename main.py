@@ -4,11 +4,11 @@ from preprocess import convert_to_wav, enhance_audio
 from transcribe import transcribe, diarise, merge_diarisation_and_transcript
 
 load_dotenv()
-INPUT_FILE = "data/raw/AIIR sample - EN.mp3"
+INPUT_FILE = "data/raw/AIIR_interview_bryan_yeoh.mp3"
 HF_TOKEN = os.environ.get("HF_TOKEN")
 
 if not HF_TOKEN:
-    print("ERROR: Hugginface token not found.")
+    print("ERROR: Huggingface token not found.")
 
 # 1. Convert & enhance
 wav_path = convert_to_wav(INPUT_FILE, "tmp/1_raw.wav")

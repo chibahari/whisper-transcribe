@@ -41,11 +41,14 @@ def transcribe(wav_path: str, output_dir: str = "output") -> dict:
     result = mlx_whisper.transcribe(
         wav_path,
         path_or_hf_repo="mlx-community/whisper-large-v3-mlx",
-        language=None,          # auto-detect; set "ms" to force Malay if needed
-        word_timestamps=True,   # per-word timestamps for alignment with diarisation
-        verbose=True,           # shows transcription progress
-        condition_on_previous_text=True,  # helps with coherence across segments
-        temperature=0.0,        # greedy decoding = more deterministic/accurate
+        language=None,
+        word_timestamps=True,
+        verbose=True,
+        condition_on_previous_text=False,  # ← CHANGE: breaks the feedback loop
+        temperature=(0.0, 0.2, 0.4, 0.6), # ← CHANGE: tuple triggers fallback on failure
+        no_speech_threshold=0.6,           # ← ADD: skip segments that are likely silence
+        compression_ratio_threshold=1.35,  # ← ADD: flag suspiciously repetitive output 
+        logprob_threshold=-1.0,            # ← ADD: skip low-confidence segments
     )
 
     # Save raw output
