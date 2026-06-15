@@ -5,7 +5,11 @@ from pyannote.audio import Pipeline
 from pyannote.audio.pipelines.utils.hook import ProgressHook
 import torch
 
-def diarise(wav_path: str, hf_token: str) -> list[dict]:
+def diarize(
+    wav_path: str,
+    hf_token: str,
+    min_speakers: int,
+    max_speakers: int) -> list[dict]:
     """
     Returns list of {speaker, start, end} dicts.
     Requires a HuggingFace token — model is gated, accept terms at:
@@ -16,14 +20,19 @@ def diarise(wav_path: str, hf_token: str) -> list[dict]:
         token=hf_token
     )
     print("Pipeline loaded from huggingface.")
-    # Use MPS on M4
+    # Use MPS on apple silicon
     pipeline.to(torch.device("mps"))
 
     with ProgressHook() as hook:
-        diarisation = pipeline(wav_path, hook=hook)
+        diarization = pipeline(
+            wav_path,
+            min_speakers=min_speakers,
+            max_speakers=max_speakers,
+            hook=hook
+        )
     segments = []
     # pyannote.audio 4.0 returns DiarizeOutput; use speaker_diarization attribute
-    for turn, speaker in diarisation.speaker_diarization:
+    for turn, _, speaker in diarization.speaker_diarization.itertracks(yield_label=True):
         segments.append({
             "speaker": speaker,
             "start": round(turn.start, 2),
@@ -41,11 +50,14 @@ def transcribe(wav_path: str, output_dir: str = "output") -> dict:
     result = mlx_whisper.transcribe(
         wav_path,
         path_or_hf_repo="mlx-community/whisper-large-v3-mlx",
-        language=None,          # auto-detect; set "ms" to force Malay if needed
-        word_timestamps=True,   # per-word timestamps for alignment with diarisation
-        verbose=True,           # shows transcription progress
-        condition_on_previous_text=True,  # helps with coherence across segments
-        temperature=0.0,        # greedy decoding = more deterministic/accurate
+        language=None,
+        word_timestamps=True,
+        verbose=True,
+        condition_on_previous_text=False,  # ← CHANGE: breaks the feedback loop
+        temperature=(0.0, 0.2, 0.4, 0.6), # ← CHANGE: tuple triggers fallback on failure
+        no_speech_threshold=0.6,           # ← ADD: skip segments that are likely silence
+        compression_ratio_threshold=1.35,  # ← ADD: flag suspiciously repetitive output 
+        logprob_threshold=-1.0,            # ← ADD: skip low-confidence segments
     )
 
     # Save raw output
@@ -55,8 +67,8 @@ def transcribe(wav_path: str, output_dir: str = "output") -> dict:
 
     return result
 
-def merge_diarisation_and_transcript(
-    segments: list[dict],      # from diarise()
+def merge_diarization_and_transcript(
+    segments: list[dict],      # from diarize()
     transcript: dict,          # from transcribe()
     output_path: str = "output/final_transcript.txt"
 ) -> str:
