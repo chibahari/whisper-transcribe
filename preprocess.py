@@ -19,7 +19,7 @@ def convert_to_wav(input_path: str, output_path: str) -> str:
     print('Converted WAV file at', output_path)
     return output_path
 
-def enhance_audio(wav_path: str, output_path: str) -> str:
+def enhance_audio(wav_path: str, output_path: str, normalised_path: str = "tmp/1_5_normalised.wav") -> str:
     """Normalise volume and reduce background noise."""
     with tqdm(total=5, desc="Enhancing audio", unit="step") as pbar:
         # 1. Load audio
@@ -29,12 +29,12 @@ def enhance_audio(wav_path: str, output_path: str) -> str:
 
         # 2. Normalise with pydub
         normalised = effects.normalize(audio)
-        normalised.export("tmp/1_5_normalised.wav", format="wav")
+        normalised.export(normalised_path, format="wav")
         pbar.update(1)
         pbar.set_postfix_str("Loading for noise reduction")
 
         # 3. Read for noise reduction
-        data, rate = sf.read("tmp/1_5_normalised.wav")
+        data, rate = sf.read(normalised_path)
         pbar.update(1)
         pbar.set_postfix_str("Reducing noise")
 
