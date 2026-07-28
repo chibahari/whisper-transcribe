@@ -40,6 +40,17 @@ def diarize(
         })
     return segments
 
+TRANSCRIBE_PROMPT = (
+    "Temu bual penyelidikan tentang pelaporan insiden AI di Malaysia. "
+    "Interviewees are from MCMC, NSC, NACSA, CSM, BNM. "
+    "Discussion covers CMA 1998 Section 263, cybersecurity incidents, "
+    "data breach, ransomware, phishing, SMB port 445, telco licensees, "
+    "postal operators, courier services, SII entities, aduan (complaints), "
+    "penyedia rangkaian, broadcasting, incident reporting. "
+    "This interview contains both Malay and English with frequent code switching."
+)
+
+
 def transcribe(wav_path: str, output_dir: str = "output") -> dict:
     """
     Transcribe using mlx-whisper with large-v3 for best multilingual accuracy.
@@ -53,11 +64,16 @@ def transcribe(wav_path: str, output_dir: str = "output") -> dict:
         language=None,
         word_timestamps=True,
         verbose=True,
-        condition_on_previous_text=False,  # ← CHANGE: breaks the feedback loop
-        temperature=(0.0, 0.2, 0.4, 0.6), # ← CHANGE: tuple triggers fallback on failure
-        no_speech_threshold=0.6,           # ← ADD: skip segments that are likely silence
-        compression_ratio_threshold=1.35,  # ← ADD: flag suspiciously repetitive output 
-        logprob_threshold=-1.0,            # ← ADD: skip low-confidence segments
+        condition_on_previous_text=False,
+        temperature=(0.0, 0.2, 0.4, 0.6),
+        no_speech_threshold=0.6,
+        compression_ratio_threshold=1.35,
+        logprob_threshold=-1.0,
+        # Skip silent runs longer than this when word timestamps suggest a
+        # hallucination — the single biggest fix for the repetition loops.
+        hallucination_silence_threshold=2.0,
+        task="transcribe",
+        initial_prompt=TRANSCRIBE_PROMPT,
     )
 
     # Save raw output
