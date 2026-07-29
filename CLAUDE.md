@@ -73,3 +73,82 @@ CSM, BNM, CMA 1998, SII, aduan, penyedia rangkaian, etc.).
 - `output/experiments/` — **new**, per-config transcripts for the 6-min
   clip, the 4-min clip covering the loop region, and the full sample.
 - `tmp/clips/` — **new**, extracted test clips.
+
+## Session log — 2026-07-29
+
+Focus: diarization configurability, merge robustness, and loop containment.
+
+### Applied changes
+
+- **Configurable speaker count.** `main.py` now reads `NUM_SPEAKERS` (exact)
+  or `MIN_SPEAKERS` / `MAX_SPEAKERS` (range) from `.env`. Errors if none
+  are set. `transcribe.diarize()` accepts an optional `num_speakers`
+  argument and forwards only the supplied kwargs to pyannote. Previous
+  hard-coded `min=2, max=3` under-covered the 2–6 requirement.
+- **Merge bug fix.** `merge_diarization_and_transcript.get_speaker()` used
+  strict containment (`seg.start <= start and seg.end >= end`), which
+  labelled ~47 % of Whisper segments as UNKNOWN whenever a segment
+  straddled a diarization turn boundary. Rewrote to use max time-overlap.
+  On the sample: UNKNOWN dropped from 64/136 (47 %) to 2/60 (3 %).
+- **Uncertainty tag.** Added `UNCERTAIN_CR_THRESHOLD` and
+  `UNCERTAIN_TAG`. Segments with `compression_ratio > 2.4` are prefixed
+  with `[UNCERTAIN — please review]` in `final_transcript.txt`.
+- **VAD pre-chunking.** New `transcribe.vad_chunks()` uses Silero VAD
+  (`min_silence=0.5 s`, `max_chunk=30 s`) to split audio at natural
+  silences. `transcribe()` now loops over chunks, calls `mlx_whisper` per
+  chunk with the audio as a numpy array, and offsets segment timestamps
+  back to absolute time. `silero-vad` added to `pyproject.toml`.
+
+### Experiments this session
+
+**Validation run (pre-VAD)** — `MAX_SPEAKERS=6`, threshold=6.0.
+- 10-segment cross-segment loop at 244–271 s, `cr=8.51`. **New** loop
+  location vs the 2026-07-28 session's 268 s loop — Whisper's decoder is
+  non-deterministic in confusing regions, so a single run is not a
+  reliable measurement.
+- Diarization returned 2 speakers (plausible — 1-on-1 interview).
+
+**Threshold 6.0 → 2.4** — no visible effect on this transcript. The CR
+distribution is bimodal (real segments < 2.2, catastrophic loops > 8) with
+nothing in between. Subtle in-segment loops (e.g. "mempunyai pengaruhan" ×5
+at `cr=2.17`) still slip through, because gzip overhead dominates on short
+strings — a fundamental limitation of per-segment CR.
+
+**`prop_decrease=0.5` (lighter noise reduction).** Worse than 0.8. Peak
+`cr=17.03`; three new loop regions (213 s, 577–605 s, 1212 s) appeared in
+the exact stretches the 0.8 baseline transcribed cleanly (data breach /
+ransomware and SMB port 445 discussion). Reverted.
+
+**VAD pre-chunking (Silero).** Kept — big win. 133 chunks (mean 10.5 s,
+min 5 s, max 48.5 s). `cr > 6.0` segments 10 → 1. Recovered dialog in
+the former loop region ("From aduan perspective, aduan is safe." / "So,
+from aduan, they will segregate based on which is related to
+cybersecurity…"). Remaining loop is a single-chunk 24 s "iaitu iaitu…" run
+at 1484 s, bounded by the VAD chunk boundary and flagged by the tag.
+Whisper runtime fell ~20 min → ~14 min.
+
+### Still-open avenues (not attempted)
+
+- **Short in-segment loops still miss.** Per-segment `compression_ratio`
+  can't catch them; a text-level heuristic (repeated n-gram detector or
+  character diversity ratio) would.
+- **Stray single-segment YouTube hallucinations** ("Terima kasih.") still
+  leak through at chunk-trailing silences. Could tune
+  `hallucination_silence_threshold` per chunk or add a text-level filter.
+- **VAD chunks can exceed `max_chunk_s`** when a speech region has no
+  silences ≥ 0.5 s (48 s max observed). A forced mid-region split with a
+  small overlap would fully cap chunk length.
+
+### Files touched this session
+
+- `main.py` — env-driven speaker count.
+- `transcribe.py` — `diarize()` speaker kwargs, `vad_chunks()` +
+  chunked `transcribe()`, max-overlap merge, uncertainty tag constants.
+- `preprocess.py` — tried `prop_decrease=0.5`, reverted to `0.8`.
+- `pyproject.toml`, `uv.lock` — added `silero-vad`.
+- `.env` — new speaker-count keys with docs.
+- `README.md`, `CLAUDE.md` — updated for this session.
+- **new**: `output/MCMC_test_pd05/`, `output/MCMC_test_vad/`
+  (comparison run artefacts).
+- **new**: `output/MCMC_test/diarization.json` — cached so future
+  merge-only iterations skip the ~2 min diarize step.
