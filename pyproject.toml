@@ -5,6 +5,8 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "accelerate>=1.14.0",
+    "hf-transfer>=0.1.9",
     "mlx-whisper>=0.4.3",
     "noisereduce>=3.0.3",
     "notebook>=7.5.5",
@@ -19,4 +21,5 @@ dependencies = [
     "torch>=2.11.0",
     "torchaudio>=2.11.0",
     "tqdm>=4.67.3",
+    "transformers>=5.14.1",
 ]

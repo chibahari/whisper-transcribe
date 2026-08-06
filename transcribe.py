@@ -1,15 +1,39 @@
-import mlx_whisper
+"""
+Transcription pipeline for Malaysian AI incident-reporting interviews.
+
+Uses the mesolitica/Malaysian-whisper-large-v3-turbo-v3 fine-tune via HF
+transformers on MPS. Audio is pre-chunked on silences with Silero VAD; each
+chunk gets a per-chunk language probe (with an English bias) so that short
+English utterances don't get mis-routed to Malay by mesolitica's Malay-
+biased language head.
+
+Diarization uses pyannote/speaker-diarization-3.1. The merge step aligns
+speaker labels to transcript segments by max time-overlap, then joins
+consecutive same-speaker segments into single turns in the final output.
+"""
+
 import json
 from pathlib import Path
+import numpy as np
+import torch
+import soundfile as sf
 from pyannote.audio import Pipeline
 from pyannote.audio.pipelines.utils.hook import ProgressHook
-import torch
-import numpy as np
-import soundfile as sf
-from tqdm import tqdm
 from silero_vad import load_silero_vad, read_audio, get_speech_timestamps
+from tqdm import tqdm
+from transformers import pipeline as hf_pipeline
+from transformers.models.whisper import tokenization_whisper
 
 SAMPLE_RATE = 16000
+MODEL_ID = "mesolitica/Malaysian-whisper-large-v3-turbo-v3"
+
+# Mesolitica registers a custom `transcribeprecise` task token. Keeping the
+# tokenizer's known-task list in sync avoids errors when the model loads.
+if "transcribeprecise" not in getattr(tokenization_whisper, "TASK_IDS", []):
+    tokenization_whisper.TASK_IDS = list(
+        getattr(tokenization_whisper, "TASK_IDS", ["translate", "transcribe"])
+    ) + ["transcribeprecise"]
+
 
 def diarize(
     wav_path: str,
@@ -29,10 +53,9 @@ def diarize(
     """
     pipeline = Pipeline.from_pretrained(
         "pyannote/speaker-diarization-3.1",
-        token=hf_token
+        token=hf_token,
     )
-    print("Pipeline loaded from huggingface.")
-    # Use MPS on apple silicon
+    print("Pyannote pipeline loaded.")
     pipeline.to(torch.device("mps"))
 
     speaker_kwargs: dict = {}
@@ -45,30 +68,16 @@ def diarize(
             speaker_kwargs["max_speakers"] = max_speakers
 
     with ProgressHook() as hook:
-        diarization = pipeline(
-            wav_path,
-            hook=hook,
-            **speaker_kwargs,
-        )
+        diarization = pipeline(wav_path, hook=hook, **speaker_kwargs)
+
     segments = []
-    # pyannote.audio 4.0 returns DiarizeOutput; use speaker_diarization attribute
     for turn, _, speaker in diarization.speaker_diarization.itertracks(yield_label=True):
         segments.append({
             "speaker": speaker,
             "start": round(turn.start, 2),
-            "end": round(turn.end, 2)
+            "end": round(turn.end, 2),
         })
     return segments
-
-TRANSCRIBE_PROMPT = (
-    "Temu bual penyelidikan tentang pelaporan insiden AI di Malaysia. "
-    "Interviewees are from MCMC, NSC, NACSA, CSM, BNM. "
-    "Discussion covers CMA 1998 Section 263, cybersecurity incidents, "
-    "data breach, ransomware, phishing, SMB port 445, telco licensees, "
-    "postal operators, courier services, SII entities, aduan (complaints), "
-    "penyedia rangkaian, broadcasting, incident reporting. "
-    "This interview contains both Malay and English with frequent code switching."
-)
 
 
 def vad_chunks(
@@ -80,8 +89,8 @@ def vad_chunks(
     """
     Split audio at natural silences using Silero VAD. Returns a list of
     (start_s, end_s) chunks. Each chunk ends at a silence >= min_silence_s
-    unless capped by max_chunk_s. This bounds how far a Whisper decoder loop
-    can propagate within a single call.
+    unless capped by max_chunk_s. Bounds how far any decoder loop can
+    propagate within a single Whisper call.
     """
     model = load_silero_vad()
     wav = read_audio(wav_path, sampling_rate=SAMPLE_RATE)
@@ -113,16 +122,72 @@ def vad_chunks(
     return chunks
 
 
-def transcribe(wav_path: str, output_dir: str = "output") -> dict:
-    """
-    Transcribe using mlx-whisper with large-v3 for best multilingual accuracy.
-    Audio is pre-chunked on silences via Silero VAD, then each chunk is
-    transcribed independently. This bounds loops to a single chunk instead
-    of letting them accumulate across Whisper's arbitrary 30 s windows.
-    language=None lets Whisper auto-detect per chunk.
-    """
-    Path(output_dir).mkdir(exist_ok=True)
+_pipeline_cache = None
 
+
+def _get_pipeline():
+    """Load the mesolitica pipeline once per process; MPS + bfloat16."""
+    global _pipeline_cache
+    if _pipeline_cache is not None:
+        return _pipeline_cache
+    device = "mps" if torch.backends.mps.is_available() else "cpu"
+    dtype = torch.bfloat16 if device == "mps" else torch.float32
+    print(f"Loading {MODEL_ID} on {device} ({dtype})…")
+    _pipeline_cache = hf_pipeline(
+        "automatic-speech-recognition",
+        model=MODEL_ID,
+        torch_dtype=dtype,
+        device=device,
+    )
+    return _pipeline_cache
+
+
+def _detect_chunk_language(
+    pipe,
+    chunk_audio: np.ndarray,
+    en_bias: float = 0.3,
+    candidate_langs: tuple[str, ...] = ("en", "ms", "id", "zh", "ta"),
+) -> str:
+    """Read language-token logits at the first decoder position and pick a
+    language. If p(en) > en_bias, prefer English — this counters the model's
+    Malay bias on short English utterances (interviewer questions, opening
+    lines) that otherwise get decoded as formal Malay."""
+    inputs = pipe.feature_extractor(
+        chunk_audio, sampling_rate=SAMPLE_RATE, return_tensors="pt"
+    )
+    dtype = next(pipe.model.parameters()).dtype
+    input_features = inputs.input_features.to(pipe.model.device, dtype)
+
+    decoder_start = pipe.model.config.decoder_start_token_id
+    decoder_input_ids = torch.tensor([[decoder_start]], device=pipe.model.device)
+    with torch.no_grad():
+        outputs = pipe.model(input_features, decoder_input_ids=decoder_input_ids)
+    lang_probs_all = torch.softmax(outputs.logits[0, -1].float(), dim=-1)
+
+    tok = pipe.tokenizer
+    probs: dict[str, float] = {}
+    for code in candidate_langs:
+        tok_id = tok.convert_tokens_to_ids(f"<|{code}|>")
+        if tok_id is not None and tok_id != tok.unk_token_id:
+            probs[code] = float(lang_probs_all[tok_id])
+
+    if not probs:
+        return "en"
+    if probs.get("en", 0.0) > en_bias:
+        return "en"
+    return max(probs, key=probs.get)
+
+
+def transcribe(
+    wav_path: str,
+    output_dir: str = "output",
+    en_bias: float = 0.3,
+) -> dict:
+    """VAD-chunk audio, detect language per chunk (with English bias), then
+    transcribe each chunk with the detected language forced. Returns a dict
+    with `text`, `segments` (each with start/end/text/_lang), and `language`
+    (always None — language varies per chunk)."""
+    Path(output_dir).mkdir(exist_ok=True)
     audio, sr = sf.read(wav_path, dtype="float32")
     assert sr == SAMPLE_RATE, f"expected {SAMPLE_RATE} Hz, got {sr}"
     if audio.ndim > 1:
@@ -131,42 +196,44 @@ def transcribe(wav_path: str, output_dir: str = "output") -> dict:
     chunks = vad_chunks(wav_path)
     print(f"VAD produced {len(chunks)} chunks")
 
+    pipe = _get_pipeline()
+
     all_segments: list[dict] = []
-    detected_language: str | None = None
+    lang_counts: dict[str, int] = {}
     for chunk_start, chunk_end in tqdm(chunks, desc="Transcribing chunks"):
-        start_sample = int(chunk_start * SAMPLE_RATE)
-        end_sample = int(chunk_end * SAMPLE_RATE)
-        chunk_audio = np.ascontiguousarray(audio[start_sample:end_sample])
+        s0, s1 = int(chunk_start * SAMPLE_RATE), int(chunk_end * SAMPLE_RATE)
+        chunk_audio = np.ascontiguousarray(audio[s0:s1])
 
-        result = mlx_whisper.transcribe(
-            chunk_audio,
-            path_or_hf_repo="mlx-community/whisper-large-v3-mlx",
-            language=None,
-            word_timestamps=True,
-            verbose=False,
-            condition_on_previous_text=False,
-            temperature=(0.0, 0.2, 0.4, 0.6),
-            no_speech_threshold=0.6,
-            compression_ratio_threshold=1.35,
-            logprob_threshold=-1.0,
-            hallucination_silence_threshold=2.0,
-            task="transcribe",
-            initial_prompt=TRANSCRIBE_PROMPT,
+        lang = _detect_chunk_language(pipe, chunk_audio, en_bias=en_bias)
+        lang_counts[lang] = lang_counts.get(lang, 0) + 1
+
+        out = pipe(
+            {"array": chunk_audio, "sampling_rate": SAMPLE_RATE},
+            return_timestamps=True,
+            generate_kwargs={"task": "transcribe", "language": lang},
         )
-        detected_language = detected_language or result.get("language")
+        for ch in out.get("chunks", []) or []:
+            ts = ch.get("timestamp") or (None, None)
+            cs, ce = ts
+            if cs is None:
+                cs = 0.0
+            if ce is None:
+                ce = cs + max(1.0, len(ch.get("text", "")) * 0.05)
+            all_segments.append({
+                "id": len(all_segments),
+                "start": float(cs) + chunk_start,
+                "end": float(ce) + chunk_start,
+                "text": ch.get("text", ""),
+                "_lang": lang,
+            })
 
-        for seg in result["segments"]:
-            seg["start"] += chunk_start
-            seg["end"] += chunk_start
-            for word in seg.get("words") or []:
-                word["start"] += chunk_start
-                word["end"] += chunk_start
-            all_segments.append(seg)
+    print(f"Language distribution across VAD chunks: {lang_counts}")
 
     combined = {
         "text": " ".join(s["text"].strip() for s in all_segments),
         "segments": all_segments,
-        "language": detected_language,
+        "language": None,
+        "_lang_counts": lang_counts,
     }
 
     out_path = Path(output_dir) / "raw_transcript.json"
@@ -175,21 +242,16 @@ def transcribe(wav_path: str, output_dir: str = "output") -> dict:
 
     return combined
 
-UNCERTAIN_CR_THRESHOLD = 2.4
-UNCERTAIN_TAG = "[UNCERTAIN — please review]"
-
 
 def merge_diarization_and_transcript(
-    segments: list[dict],      # from diarize()
-    transcript: dict,          # from transcribe()
-    output_path: str = "output/final_transcript.txt"
+    segments: list[dict],
+    transcript: dict,
+    output_path: str = "output/final_transcript.txt",
 ) -> str:
-    """Align speaker labels with transcript words by timestamp overlap."""
+    """Align speaker labels to transcript segments by max time-overlap, then
+    concatenate consecutive same-speaker segments into a single turn."""
 
     def get_speaker(start: float, end: float) -> str:
-        # Max-overlap: pick the diarization turn that shares the most time
-        # with this Whisper segment. Strict containment would leave every
-        # segment that straddles a turn boundary as UNKNOWN.
         best_overlap = 0.0
         best_speaker = "UNKNOWN"
         for seg in segments:
@@ -199,29 +261,35 @@ def merge_diarization_and_transcript(
                 best_speaker = seg["speaker"]
         return best_speaker
 
-    lines = []
-    current_speaker = None
-    current_text = []
+    turns = []
+    cur_speaker: str | None = None
+    cur_text: list[str] = []
+    cur_start: float | None = None
+    cur_end: float | None = None
 
     for segment in transcript["segments"]:
         speaker = get_speaker(segment["start"], segment["end"])
         text = segment["text"].strip()
-        if segment.get("compression_ratio", 0) > UNCERTAIN_CR_THRESHOLD:
-            text = f"{UNCERTAIN_TAG} {text}"
-
-        if speaker != current_speaker:
-            if current_text:
-                lines.append(f"[{current_speaker}]\n" + " ".join(current_text))
-            current_speaker = speaker
-            current_text = [text]
+        if not text:
+            continue
+        if speaker != cur_speaker:
+            if cur_text:
+                turns.append((cur_speaker, cur_start, cur_end, " ".join(cur_text)))
+            cur_speaker = speaker
+            cur_text = [text]
+            cur_start = segment["start"]
+            cur_end = segment["end"]
         else:
-            current_text.append(text)
+            cur_text.append(text)
+            cur_end = segment["end"]
+    if cur_text:
+        turns.append((cur_speaker, cur_start, cur_end, " ".join(cur_text)))
 
-    if current_text:
-        lines.append(f"[{current_speaker}]\n" + " ".join(current_text))
+    lines = []
+    for speaker, start, end, text in turns:
+        lines.append(f"[{speaker}] ({start:.1f}s–{end:.1f}s)\n{text}")
 
     output = "\n\n".join(lines)
     with open(output_path, "w", encoding="utf-8") as f:
         f.write(output)
-
     return output
