@@ -9,6 +9,14 @@ were tried, and what remains open.
 For usage instructions see `README.md`. For per-session changelogs see
 `CLAUDE.md`.
 
+> **Status (2026-08-06).** The current pipeline transcribes via
+> `mesolitica/Malaysian-whisper-large-v3-turbo-v3` (a Malaysian fine-tune
+> of Whisper) with VAD pre-chunking and per-chunk language routing — not
+> `mlx_whisper`. §3 and §6 describe the current design. §5.7 documents
+> the migration. §5.1–5.6 remain as the historical iteration that
+> preceded it — the constraints, guards, and lessons are still relevant
+> even though the model changed.
+
 ---
 
 ## 1. Objective
@@ -27,8 +35,8 @@ and cite it — not perfect, but not misleading.
   ada meksis, telekom dan lain-lain").
 - **Audio quality.** Not guaranteed clean; realistic recordings with
   ambient noise, uneven volume, and interviewee hesitation.
-- **Local execution.** Runs on Apple Silicon via MLX for Whisper and MPS
-  for pyannote — no cloud calls for the audio itself.
+- **Local execution.** Runs on Apple Silicon via MPS for both Whisper and
+  pyannote — no cloud calls for the audio itself.
 - **Domain vocabulary.** Interviewees are from Malaysian regulators
   (MCMC, NSC, NACSA, CSM, BNM) and discuss specific legislation
   (CMA 1998), technical concepts (SMB port 445, ransomware, phishing),
@@ -47,19 +55,25 @@ The pipeline lives in three files and runs sequentially from `main.py`:
    on MPS, constrained by `NUM_SPEAKERS` (exact) or `MIN_SPEAKERS` /
    `MAX_SPEAKERS` (range). Returns `{speaker, start, end}` turns.
 4. **Transcribe** (`transcribe.transcribe`) — Silero VAD chunks the audio
-   at silences, then `mlx_whisper` transcribes each chunk with a domain
-   prompt and a hallucination guard. Segment timestamps are re-anchored
-   to absolute time before concatenation.
+   at silences. For each chunk we run a **one-step language probe** that
+   reads the language-token logits at the first decoder position, apply
+   an **English bias** (force `en` when `p(en) > 0.3`, else the top
+   language), then transcribe the chunk with that language forced. The
+   model is `mesolitica/Malaysian-whisper-large-v3-turbo-v3` via
+   HuggingFace transformers on MPS (bfloat16). Segment timestamps are
+   re-anchored to absolute time before concatenation.
 5. **Merge** (`transcribe.merge_diarization_and_transcript`) — assigns
-   each Whisper segment to the speaker with maximum time-overlap, applies
-   the `[UNCERTAIN — please review]` tag to high-`compression_ratio`
-   segments, and writes `final_transcript.txt`.
+   each transcript segment to the speaker with maximum time-overlap, then
+   concatenates consecutive same-speaker segments into single turns.
+   Writes `final_transcript.txt`.
 
 Two supporting utilities:
 
-- `experiment.py` — config-comparison harness. Runs named
-  `mlx_whisper.transcribe` configs against a clip and writes per-config
-  outputs plus a `summary.txt` with loop counts and timings.
+- `experiment.py` — multi-backend config-comparison harness. Supports
+  `mlx_whisper` (historical baselines), `hf_transformers` (mesolitica via
+  pipeline), and `hf_transformers_per_chunk_lang` (mesolitica + VAD +
+  per-chunk language detect — mirrors the production `transcribe.py`).
+  See `output/experiments/README.md` for the full config catalogue.
 - `output/{RUN_NAME}/diarization.json` — cached diarization output so
   merge-only iterations skip the ~2 min diarize step.
 
@@ -173,6 +187,10 @@ answer) became legible for the first time.
 
 ### 5.4 Uncertainty flagging
 
+> Removed in §5.7 when we switched to mesolitica's HF pipeline, which
+> doesn't expose per-segment `compression_ratio`. Documented here for
+> the pattern; a text-level replacement is listed in §8.1.
+
 Any Whisper segment with `compression_ratio > 2.4` is prefixed with
 `[UNCERTAIN — please review]` in the final transcript. The threshold was
 first set to 6.0 (catches only the pathological tier), then lowered to
@@ -234,74 +252,149 @@ VAD-detectable silence — the uncertainty tag catches it cleanly
 The runtime drop was an unexpected bonus. Shorter chunks mean less
 wasted decoding on padding at the tail of Whisper's 30 s windows.
 
+### 5.7 Model swap to mesolitica + per-chunk language routing (2026-08-06)
+
+The reviewer tagged ~5 min of `final_transcript.txt` and found the
+dominant residual failure was **English speech decoded as gibberish
+Malay**, especially in the first 3 min of the recording where the
+interviewer opens with short English questions. Also occasional
+"hallucinated Malay" in silence pockets. The uncertainty tag caught
+almost none of it because these weren't loops — they were confidently
+wrong outputs with plausible `compression_ratio`.
+
+**Root cause.** `whisper-large-v3` on this material was doing per-chunk
+language auto-detection, and short English-only chunks (interviewer
+questions, opening lines) were being classified as Malay. Once the
+language head landed on Malay, the decoder dutifully emitted Malay
+tokens for the English acoustics, producing formal Bahasa that had no
+resemblance to what was said.
+
+**Model swap.** Adopted `mesolitica/Malaysian-whisper-large-v3-turbo-v3`
+— a fine-tune of `whisper-large-v3-turbo` trained explicitly on Malaysian
+speech with Manglish (Malay-English) code-switching, plus Mandarin and
+Tamil. No MLX conversion published, so runs via HF transformers + MPS
+with bfloat16. Fine-tuned model handled code-switching within a single
+utterance natively (e.g. "if let's say macam licensee ada incident they
+have to report to us") which the base model kept splitting into two
+translations.
+
+**Iteration on the mesolitica pipeline** (details in
+`output/experiments/README.md`):
+
+| Config | Change | Result |
+|---|---|---|
+| `M_mesolitica_turbo` | first attempt, `stride_length_s=5` | Fixed loops and most mistranslation; **introduced** intra-turn duplication (same clause transcribed once in English and once in formal Malay from chunk overlaps). |
+| `M2_stride0` | `stride_length_s=0` | Duplication gone (chars −15%). Opening 0-13s and interviewer stretches at 397-430s **still all-Malay**. |
+| `M3_lang_en` | force `language="en"` globally | Fixed interviewer stretches, over-anglicized real Manglish content ("a series that is a if it is a series for telecommunications"). Rejected. |
+| `M4_detect_lang` | **VAD + per-chunk language probe + `en_bias=0.3`** | Fixed all three previously-flagged regions. Language split ~52/48 en/ms on the sample. **Adopted.** |
+
+**Why the English bias.** The failure mode is asymmetric — mesolitica's
+Malay-biased language head loses English chunks, but rarely the
+reverse. Setting a threshold "prefer English if `p(en) > 0.3` even when
+Malay's raw probability is higher" biases against the observed failure
+without regressing on Malay-dominant chunks. If future recordings shift
+toward more Malay-dominant material, lower the threshold.
+
+**What we lost.** Mesolitica pipeline output doesn't expose per-segment
+`compression_ratio`, so the `[UNCERTAIN — please review]` tag from §5.4
+is no longer emitted. M4 produced 0 loops on the 26 min sample, so this
+hasn't bitten yet — but if loops resurface, a text-level detector
+(repeated n-gram or low character-diversity) would replace it.
+
+**Speaker-turn merging.** Mesolitica's pipeline emits word-level
+segments (~800 for the 26 min sample). Without merging, the final
+transcript would fragment into a wall of single-word turns.
+`merge_diarization_and_transcript()` now concatenates consecutive
+same-speaker segments into single turns (65 turns on the sample), which
+reads as natural dialog.
+
 ---
 
 ## 6. Final design decisions
 
-- **Model: `whisper-large-v3-mlx`.** Turbo trades accuracy for speed here
-  in a way that we can't afford — its hallucination pattern is worse than
-  large-v3's on this audio.
-- **Auto language detection (`language=None`).** With code-switching in
-  every other sentence, forcing a single language would systematically
-  mistranscribe half the content.
+- **Model: `mesolitica/Malaysian-whisper-large-v3-turbo-v3`.** A
+  Malaysian fine-tune trained on Manglish code-switching. Base Whisper
+  and its own turbo variant were both worse on interviewer English
+  stretches (see §5.7). No MLX conversion published, so we accept the
+  transformers + MPS runtime cost — quality was the priority.
+- **Per-chunk language detection with English bias
+  (`en_bias=0.3`).** VAD pre-chunk the audio, probe the language-token
+  logits, force the detected language during decode. Bypasses the
+  pipeline auto-detect that biased short English chunks toward Malay.
 - **VAD pre-chunking on by default.** No parameter to disable it — the
-  quality delta is too large and the runtime cost is negative.
-- **Rich domain prompt.** The prompt is a code artefact
-  (`transcribe.TRANSCRIBE_PROMPT`), not a config knob, because it's
-  interview-topic-specific. Different interview topics will need
-  different prompts.
-- **Uncertainty tag as reviewer safety net.** Not a "fix" — an admission
-  that some hallucinations will slip through, and a way to make them
-  visible for spot-checking.
+  quality delta is too large and the runtime cost is negligible. Still
+  serves as loop insurance even though mesolitica loops less than the
+  MLX baseline.
+- **Speaker-turn merging in the final transcript.** Mesolitica's
+  pipeline output is word-level; without merging, `final_transcript.txt`
+  fragments into a wall of single-word entries. Consecutive same-speaker
+  segments become one turn.
+- **No `initial_prompt`.** The HF pipeline API doesn't take one the same
+  way `mlx_whisper` did, and the fine-tuned model already handles the
+  domain vocabulary. If proper-noun accuracy regresses on new material,
+  revisit via `generate_kwargs`.
 
 ---
 
 ## 7. Known limitations
 
+- **No automated loop detection.** Mesolitica pipeline output doesn't
+  expose `compression_ratio`, so the `[UNCERTAIN]` tag from §5.4 is
+  gone. M4 produced 0 loops on the 26 min sample and the reviewer saw
+  none in the merged output, but if loops surface on longer/harder
+  material there is currently no automated flag. A text-level detector
+  (§8.1) would restore this.
+- **`en_bias` is a single global knob.** Chosen for interviews where
+  English is the more commonly mis-routed language. If the source
+  material shifts (e.g. mostly Malay interviews with the interviewer
+  code-switching to English rarely), the threshold likely needs to move
+  in the other direction. Currently no per-speaker or per-recording
+  override.
 - **Non-determinism.** Whisper's decoder gives different output between
-  runs on the same audio, especially in confusing regions. A single run
-  is not a reliable measurement — reproducibility of the transcript is
-  limited.
-- **Short in-segment loops.** Per-segment `compression_ratio` cannot
-  detect them (see §5.4). VAD reduces but does not eliminate them.
-- **Long chunks bypass the VAD benefit.** If a speech region has no
+  runs on the same audio. Reproducibility of any specific transcription
+  is limited — treat the transcript as one sample from a distribution,
+  not a fixed truth.
+- **Long chunks bypass some VAD benefit.** If a speech region has no
   silence ≥ 0.5 s, the chunk exceeds `max_chunk_s` (48.5 s max seen on
-  the sample) and Whisper resumes its internal 30 s windowing. Loops
-  inside that chunk can span multiple internal windows.
-- **Stray hallucinations at chunk boundaries.** "Terima kasih." on
-  chunk-trailing silence occasionally slips through — a single-segment
-  event, low CR, invisible to the uncertainty tag.
+  the sample) and the model resumes its internal 30 s windowing inside
+  the chunk. Loops inside such a chunk can span multiple internal
+  windows.
 - **Diarization treats overlap as one speaker.** pyannote's turns are
   disjoint; when two speakers talk over each other the transcript will
   attribute the audio to one of them.
-- **Prompt is topic-specific.** A different interview series (e.g. on
-  healthcare AI) would need its own vocabulary in `TRANSCRIBE_PROMPT` to
-  see equivalent proper-noun accuracy.
+- **Occasional proper-noun mishearings.** The end-to-end run on the
+  MCMC sample produced "MCM Zero" (probably "MCMC role"),
+  "Naval Security" (probably "Network Security"), "TEKO" (probably
+  "telco"). Small enough to spot-fix in review, but a consistent
+  pattern to watch for on new material.
 
 ## 8. Future work
 
 Ordered by expected impact per unit of implementation effort:
 
-1. **Text-level loop detector for the uncertainty tag.** A simple
-   repeated-n-gram check (e.g. any 3-word phrase repeated 3+ times in a
-   segment) would catch the class of short in-segment loops that CR
-   misses. Cheap.
+1. **Text-level loop detector.** A simple repeated-n-gram check (e.g. any
+   3-word phrase repeated 3+ times in a segment) would give us back the
+   automated `[UNCERTAIN]` flag that we lost when we moved to
+   mesolitica's pipeline output. Cheap.
 2. **Forced mid-region VAD split with overlap.** When a speech region
    exceeds `max_chunk_s`, hard-cut at 25 s with a 2 s overlap into the
-   next chunk. Fully caps chunk length; the overlap gives Whisper enough
-   context to avoid boundary artefacts.
-3. **Domain prompt per RUN_NAME.** Move `TRANSCRIBE_PROMPT` out of
-   `transcribe.py` into a per-interview file (e.g.
-   `data/prompts/{RUN_NAME}.txt`), so the pipeline can serve multiple
-   interview topics without code changes.
-4. **Speaker labelling.** After a run, let the reviewer supply real names
+   next chunk. Fully caps chunk length; the overlap gives the decoder
+   enough context to avoid boundary artefacts.
+3. **Speaker labelling.** After a run, let the reviewer supply real names
    for `SPEAKER_00`, `SPEAKER_01`, … and re-emit the transcript. Trivial
    post-pass, big usability win for downstream research.
-5. **Multiple-run consensus for confusing regions.** For any chunk that
-   emits high-CR output on run N, re-transcribe with a different
-   `temperature` seed on run N+1. Keep whichever has the lower CR. Non-cheap
-   (2× runtime on affected chunks) but the most principled way to attack
-   the non-determinism problem.
+4. **Per-recording `en_bias` config.** Allow `.env` (or a per-run YAML)
+   to override `en_bias`. Interviews vary in language dominance; a
+   single global knob will not fit all future material.
+5. **Gemini or GPT-4o audio backend as A/B.** Cloud multilingual ASR
+   models handle Malay-English code-switching in ways worth benchmarking
+   against mesolitica on the current sample. Deferred while local
+   quality is acceptable.
+6. **Multiple-run consensus for confusing regions.** For any chunk with
+   suspicious output (short internal loop, or the text-level detector
+   fires), re-transcribe with a different temperature seed on run N+1.
+   Keep whichever the detector prefers. Attacks the non-determinism
+   problem directly at ~1.1x average cost.
 
 ## 9. Lessons learned
 
@@ -325,3 +418,21 @@ Ordered by expected impact per unit of implementation effort:
   change between runs on the same clean WAV. Caching it made
   merge-parameter iteration go from "20 min per attempt" to "10 s per
   attempt", which changed how much iteration was feasible.
+- **A domain-specific fine-tune beats parameter tuning.** Weeks of
+  iterating on Whisper decoder parameters produced meaningful but
+  bounded improvements. Swapping to the Malaysian fine-tune (§5.7)
+  produced a bigger quality jump than every prior decoder-config change
+  combined. Reach for a specialised model before assuming the general
+  one just needs more tuning.
+- **Language mis-detection is asymmetric.** The failure mode on this
+  material was "English forced into Malay", not the reverse — so a
+  cheap unidirectional bias (`en_bias`) fixed most of it without
+  regressing the working direction. Symmetric fixes (dual-decode both
+  languages, pick better logprob) would have been 2× the cost with no
+  additional quality. Diagnose the *direction* of the failure before
+  fixing.
+- **Ask about "unworkable" before shipping.** Two rounds of "looks
+  much better" ended with the reviewer saying the output wasn't usable.
+  Post-review calibration is essential — statistical improvements on
+  loops and duplication counts don't translate directly to reviewer
+  trust if a single visible mistranslation region remains.
