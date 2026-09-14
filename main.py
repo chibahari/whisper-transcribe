@@ -51,5 +51,10 @@ speaker_segments = diarize(
 transcript = transcribe(clean_wav, output_dir=str(output_dir))
 
 # 4. Merge
-final = merge_diarization_and_transcript(speaker_segments, transcript, output_path=str(output_dir / "final_transcript.txt"))
-print(f"Done! Transcript saved to {output_dir}/final_transcript.txt")
+final = merge_diarization_and_transcript(
+    speaker_segments,
+    transcript,
+    output_path=str(output_dir / "final_transcript.md"),
+    source_name=Path(INPUT_FILE).name if INPUT_FILE else None,
+)
+print(f"Done! Transcript saved to {output_dir}/final_transcript.md")

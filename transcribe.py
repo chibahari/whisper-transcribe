@@ -32,7 +32,6 @@ MODEL_ID = "mesolitica/Malaysian-whisper-large-v3-turbo-v3"
 # from the mlx_whisper era, which the HF pipeline doesn't expose. A turn is
 # flagged when the same word repeats >= LOOP_UNIGRAM_RUN times in a row, or
 # the same 2-word phrase repeats >= LOOP_BIGRAM_RUN times in a row.
-UNCERTAIN_TAG = "[UNCERTAIN — please review]"
 LOOP_UNIGRAM_RUN = 5
 LOOP_BIGRAM_RUN = 4
 _WORD_RE = re.compile(r"[\w']+", re.UNICODE)
@@ -280,13 +279,22 @@ def transcribe(
     return combined
 
 
+def _format_time(seconds: float) -> str:
+    """MM:SS for transcript timestamps."""
+    m, s = divmod(int(seconds), 60)
+    return f"{m:02d}:{s:02d}"
+
+
 def merge_diarization_and_transcript(
     segments: list[dict],
     transcript: dict,
-    output_path: str = "output/final_transcript.txt",
+    output_path: str = "output/final_transcript.md",
+    source_name: str | None = None,
 ) -> str:
-    """Align speaker labels to transcript segments by max time-overlap, then
-    concatenate consecutive same-speaker segments into a single turn."""
+    """Align speaker labels to transcript segments by max time-overlap,
+    concatenate consecutive same-speaker segments into a single turn, and
+    write a Markdown file. Turns flagged by `contains_loop` get a blockquote
+    review note above the body."""
 
     def get_speaker(start: float, end: float) -> str:
         best_overlap = 0.0
@@ -322,12 +330,22 @@ def merge_diarization_and_transcript(
     if cur_text:
         turns.append((cur_speaker, cur_start, cur_end, " ".join(cur_text)))
 
-    lines = []
-    for speaker, start, end, text in turns:
-        prefix = f"{UNCERTAIN_TAG} " if contains_loop(text) else ""
-        lines.append(f"[{speaker}] ({start:.1f}s–{end:.1f}s)\n{prefix}{text}")
+    lines: list[str] = ["# Interview transcript", ""]
+    if source_name:
+        lines.append(f"_Source: {source_name}_  ")
+    lines.append(f"_Model: {MODEL_ID}_")
+    lines += ["", "---", ""]
 
-    output = "\n\n".join(lines)
+    for speaker, start, end, text in turns:
+        lines.append(f"**{speaker}** · {_format_time(start)}–{_format_time(end)}")
+        lines.append("")
+        if contains_loop(text):
+            lines.append("> **Review needed** — possible transcription loop")
+            lines.append("")
+        lines.append(text)
+        lines.append("")
+
+    output = "\n".join(lines).rstrip() + "\n"
     with open(output_path, "w", encoding="utf-8") as f:
         f.write(output)
     return output

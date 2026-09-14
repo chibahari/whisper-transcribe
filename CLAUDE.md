@@ -325,9 +325,42 @@ mesolitica migration) using a text-level detector instead of per-segment
   triggered hallucinations at chunk boundaries (open since the
   2026-07-29 session).
 
+### Markdown transcript output
+
+Second change this session: switch the final-transcript emitter from
+`final_transcript.txt` to `final_transcript.md`. Reviewer workflow is
+"read for information + light edits to fix transcription errors" and
+needs to work in any editor, so Markdown fits — plain text under the
+hood, renders in VS Code / GitHub / Obsidian, edits stay trivial.
+Rejected `.docx` (Word-specific, not platform-agnostic) and `.html`
+(harder to hand-edit).
+
+Format:
+
+- Header block: `# Interview transcript`, italic source filename and
+  model ID, `---` rule.
+- Per turn: `**SPEAKER_XX** · MM:SS–MM:SS` on one line, blank line,
+  turn body as a paragraph. Timestamps are MM:SS (was raw seconds).
+- Flagged turns: blockquote note `> **Review needed** — possible
+  transcription loop` between the speaker line and the body, chosen
+  over an inline tag so the flag is visually prominent for the
+  reviewer.
+- `UNCERTAIN_TAG` constant removed (dead — the blockquote text is
+  emitted inline in `merge_diarization_and_transcript`).
+
+`main.py` passes `source_name=Path(INPUT_FILE).name` and writes to
+`{output_dir}/final_transcript.md`. Regenerated
+`output/MCMC_test/final_transcript.md` from cached raw transcript +
+diarization; deleted the stale `.txt`.
+
 ### Files touched this session
 
-- `transcribe.py` — added `contains_loop`, `UNCERTAIN_TAG`,
-  `LOOP_UNIGRAM_RUN`, `LOOP_BIGRAM_RUN`; `merge_diarization_and_transcript`
-  now prefixes flagged turns.
+- `transcribe.py` — added `contains_loop`, `LOOP_UNIGRAM_RUN`,
+  `LOOP_BIGRAM_RUN`, `_format_time`; rewrote
+  `merge_diarization_and_transcript` to emit Markdown with header
+  metadata and a blockquote for flagged turns; new `source_name`
+  parameter.
+- `main.py` — passes `source_name` and writes `.md` instead of `.txt`.
+- `output/MCMC_test/final_transcript.md` — regenerated.
+- `output/MCMC_test/final_transcript.txt` — deleted (stale).
 - `CLAUDE.md` — this log.
