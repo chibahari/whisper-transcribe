@@ -13,6 +13,7 @@ consecutive same-speaker segments into single turns in the final output.
 """
 
 import json
+import re
 from pathlib import Path
 import numpy as np
 import torch
@@ -26,6 +27,42 @@ from transformers.models.whisper import tokenization_whisper
 
 SAMPLE_RATE = 16000
 MODEL_ID = "mesolitica/Malaysian-whisper-large-v3-turbo-v3"
+
+# Text-level loop detector — replaces the per-segment compression_ratio tag
+# from the mlx_whisper era, which the HF pipeline doesn't expose. A turn is
+# flagged when the same word repeats >= LOOP_UNIGRAM_RUN times in a row, or
+# the same 2-word phrase repeats >= LOOP_BIGRAM_RUN times in a row.
+UNCERTAIN_TAG = "[UNCERTAIN — please review]"
+LOOP_UNIGRAM_RUN = 5
+LOOP_BIGRAM_RUN = 4
+_WORD_RE = re.compile(r"[\w']+", re.UNICODE)
+
+
+def contains_loop(
+    text: str,
+    unigram_run: int = LOOP_UNIGRAM_RUN,
+    bigram_run: int = LOOP_BIGRAM_RUN,
+) -> bool:
+    """True if `text` contains a run of consecutive repeated tokens likely to
+    be a decoder loop."""
+    words = [w.lower() for w in _WORD_RE.findall(text)]
+    run = 1
+    for i in range(1, len(words)):
+        run = run + 1 if words[i] == words[i - 1] else 1
+        if run >= unigram_run:
+            return True
+    i = 0
+    while i < len(words) - 1:
+        a, b = words[i], words[i + 1]
+        count = 1
+        j = i + 2
+        while j + 1 < len(words) and words[j] == a and words[j + 1] == b:
+            count += 1
+            j += 2
+        if count >= bigram_run:
+            return True
+        i += 1
+    return False
 
 # Mesolitica registers a custom `transcribeprecise` task token. Keeping the
 # tokenizer's known-task list in sync avoids errors when the model loads.
@@ -287,7 +324,8 @@ def merge_diarization_and_transcript(
 
     lines = []
     for speaker, start, end, text in turns:
-        lines.append(f"[{speaker}] ({start:.1f}s–{end:.1f}s)\n{text}")
+        prefix = f"{UNCERTAIN_TAG} " if contains_loop(text) else ""
+        lines.append(f"[{speaker}] ({start:.1f}s–{end:.1f}s)\n{prefix}{text}")
 
     output = "\n\n".join(lines)
     with open(output_path, "w", encoding="utf-8") as f:

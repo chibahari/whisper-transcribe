@@ -270,3 +270,64 @@ sample vs. `C_rich_prompt` baseline):
   `output/MCMC_test_vad/`, ~700 MB of `tmp/` preprocessing
   intermediates, `output/final_transcript.txt` +
   `output/raw_transcript.json` (May-era orphans).
+
+## Session log — 2026-09-14
+
+Focus: restore the `[UNCERTAIN — please review]` tag (lost in the mlx →
+mesolitica migration) using a text-level detector instead of per-segment
+`compression_ratio`.
+
+### Applied change
+
+- **Text-level loop detector.** `transcribe.py` gains
+  `contains_loop(text)` which flags a turn when it contains either
+  `LOOP_UNIGRAM_RUN=5` copies of the same word in a row or
+  `LOOP_BIGRAM_RUN=4` copies of the same 2-word phrase in a row (non-
+  overlapping). Tokenization is `[\w']+` so punctuation doesn't break
+  the run.
+- **Applied at the turn level, not the segment level.** Mesolitica emits
+  ~word-sized segments (~16 chars mean); a per-segment tag would be
+  meaningless. `merge_diarization_and_transcript()` now prefixes each
+  concatenated turn with `UNCERTAIN_TAG` when `contains_loop(turn_text)`
+  fires.
+
+### Validation
+
+- Historic loop strings from prior sessions (`kebanyakan × 15+`,
+  `iaitu × 8`, `Use × 5`, `mempunyai pengaruhan × 4`,
+  `Malaysia masuk × 4`) all flag True.
+- Clean examples do not flag, including natural stutter cases:
+  `"yes, yes, I understand"`, `"very very important"`, `"okay okay so
+  we started"`, `"and and and"`, `"I think, I think, I think we can"`
+  (3× "I think" — under the 4-repeat bigram threshold),
+  `"no no no no"` (4× "no" — under the 5-repeat unigram threshold).
+- Re-scanning M4's merged output flags **0/65 turns**, matching the
+  prior session's observation that M4 had no loops on the sample.
+- Synthetic plumbing test: injecting 5 word-segments of `"kebanyakan"`
+  into a fake transcript produces exactly one tagged turn.
+
+### Rationale for thresholds
+
+- `unigram_run=5`: real loops observed in prior sessions had 10-25+
+  repeats, so 5 is well inside the safety margin. Natural affirmations
+  ("yes yes yes", "no no no no") sit at 3–4.
+- `bigram_run=4`: real 2-word loops (`mempunyai pengaruhan × 4+`) sit
+  at 4+ non-overlapping repeats. Natural doubled clauses
+  ("I think, I think, I think") sit at 3.
+- Non-overlapping bigram counting is important: an overlapping counter
+  false-positives on 3× "I think" by triple-counting shifted windows.
+
+### Still-open avenues (not attempted)
+
+- Character-diversity ratio as a second heuristic — not needed given
+  the n-gram detector caught every historic loop cleanly.
+- Per-chunk `hallucination_silence_threshold` for stray silence-
+  triggered hallucinations at chunk boundaries (open since the
+  2026-07-29 session).
+
+### Files touched this session
+
+- `transcribe.py` — added `contains_loop`, `UNCERTAIN_TAG`,
+  `LOOP_UNIGRAM_RUN`, `LOOP_BIGRAM_RUN`; `merge_diarization_and_transcript`
+  now prefixes flagged turns.
+- `CLAUDE.md` — this log.
